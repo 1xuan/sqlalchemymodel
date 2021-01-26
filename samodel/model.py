@@ -27,6 +27,13 @@ class Base:
     def __repr__(self):
         return f"<{self.__class__.__name__}(id={self.id})>"
 
+    @classmethod
+    def insert_by_conn(cls, conn, **kwargs):
+        table = inspect(cls).mapped_table
+        table_ins = table.insert().values(**kwargs)
+        result = conn.execute(table_ins)
+        return result
+
 
 Model = Base
 
@@ -39,7 +46,6 @@ user_role_rel = sa.Table(
 
 
 class User(Model):
-
     name = Column(sa.String)
     username = Column(sa.String, nullable=False)
     password = Column(sa.String, nullable=False)
@@ -60,7 +66,6 @@ class User(Model):
 
 
 class Role(Model):
-
     name = Column(sa.String, nullable=False)
 
     @declared_attr
@@ -73,7 +78,6 @@ class Role(Model):
 
 
 class Permission(Model):
-
     @declared_attr
     def roles(self):
         return Column(sa.Integer, sa.ForeignKey('role.id'))
@@ -91,7 +95,6 @@ class Permission(Model):
 
 
 class UserActionLog(Model):
-
     table_name = Column(sa.String)
     datetime = Column(sa.DateTime, default=datetime.now)
     operation = Column(sa.String)
@@ -100,7 +103,6 @@ class UserActionLog(Model):
 
 
 class UserActionLogField(Model):
-
     action_log_id = Column(sa.Integer, sa.ForeignKey('user_action_log.id'))
     field = Column(sa.String)
     old_value = Column(sa.String)
@@ -109,25 +111,64 @@ class UserActionLogField(Model):
 
 @event.listens_for(Model, 'after_insert', propagate=True)
 def event_after_insert(mapper, connection, target):
-    """ Record all operations about creating records,
-     including all fields changes against tables
-    """
-    log_table = inspect(UserActionLog).mapped_table
-    log_table_ins = log_table.insert().values(
-                        table_name=mapper.mapped_table.name,
-                        datetime=datetime.now(),
-                        operation='create',
-                        record_id=target.id
-                    )
-    result = connection.execute(log_table_ins)
 
-    logfield_table = inspect(UserActionLogField).mapped_table
+    # Record all operations about creating records,
+    # including all fields changes against tables
+    result = UserActionLog.insert_by_conn(
+        conn=connection,
+        operation='create',
+        table_name=mapper.mapped_table.name,
+        datetime=datetime.now(),
+        record_id=target.id
+    )
+
     tb_cols = {col.key for col in mapper.mapped_table.columns}
     for k, v in target.__dict__.items():
         if k in tb_cols and k != 'id':
-            logfield_table_ins = logfield_table.insert().values(
+            UserActionLogField.insert_by_conn(
+                conn=connection,
                 action_log_id=result.lastrowid,
                 field=k,
                 new_value=v
             )
-            connection.execute(logfield_table_ins)
+
+
+@event.listens_for(Model, 'after_update', propagate=True)
+def event_after_update(mapper, connection, target):
+
+    # Record all operations about updating records
+    result = UserActionLog.insert_by_conn(
+        conn=connection,
+        operation='update',
+        table_name=mapper.mapped_table.name,
+        datetime=datetime.now(),
+        record_id=target.id
+    )
+
+    for attr in inspect(target).attrs:
+
+        history = attr.load_history()
+        if not history.has_changes():
+            continue
+
+        new_value = history.added[0]
+        old_value = history.deleted[0]
+
+        UserActionLogField.insert_by_conn(
+            conn=connection,
+            action_log_id=result.lastrowid,
+            field=attr.key,
+            old_value=old_value,
+            new_value=new_value
+        )
+
+
+@event.listens_for(Model, 'after_delete', propagate=True)
+def event_after_delete(mapper, connection, target):
+    UserActionLog.insert_by_conn(
+        conn=connection,
+        operation='delete',
+        table_name=mapper.mapped_table.name,
+        datetime=datetime.now(),
+        record_id=target.id
+    )
