@@ -1,7 +1,7 @@
 from datetime import datetime
 
 import sqlalchemy as sa
-from sqlalchemy import Column
+from sqlalchemy import Column, event, inspect
 from sqlalchemy.orm import relationship, validates
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
@@ -39,13 +39,15 @@ user_role_rel = sa.Table(
 
 
 class User(Model):
-    __abstract__ = True
 
     name = Column(sa.String)
     username = Column(sa.String, nullable=False)
     password = Column(sa.String, nullable=False)
     active = Column(sa.Boolean, default=True)
-    roles = relationship('Role', secondary=user_role_rel, back_populates='users')
+
+    @declared_attr
+    def roles(self):
+        return relationship('Role', secondary=user_role_rel, back_populates='users')
 
     @classmethod
     def authenticate(cls, db, username, password):
@@ -58,15 +60,23 @@ class User(Model):
 
 
 class Role(Model):
-    __abstract__ = True
 
     name = Column(sa.String, nullable=False)
-    perms = relationship('Permission', cascade='all, delete-orphan')
-    users = relationship('User', secondary=user_role_rel, back_populates='roles')
+
+    @declared_attr
+    def perms(self):
+        return relationship('Permission', cascade='all, delete-orphan')
+
+    @declared_attr
+    def users(self):
+        return relationship('User', secondary=user_role_rel, back_populates='roles')
 
 
 class Permission(Model):
-    __abstract__ = True
+
+    @declared_attr
+    def roles(self):
+        return Column(sa.Integer, sa.ForeignKey('role.id'))
 
     model = Column(sa.String)
     read_perm = Column(sa.Boolean)
@@ -81,9 +91,43 @@ class Permission(Model):
 
 
 class UserActionLog(Model):
-    __abstract__ = True
 
-    user_id = Column(sa.Integer, sa.ForeignKey('user.id'))
-    user = relationship('User')
+    table_name = Column(sa.String)
     datetime = Column(sa.DateTime, default=datetime.now)
     operation = Column(sa.String)
+    record_id = Column(sa.Integer)
+    log_fields = relationship('UserActionLogField')
+
+
+class UserActionLogField(Model):
+
+    action_log_id = Column(sa.Integer, sa.ForeignKey('user_action_log.id'))
+    field = Column(sa.String)
+    old_value = Column(sa.String)
+    new_value = Column(sa.String)
+
+
+@event.listens_for(Model, 'after_insert', propagate=True)
+def event_after_insert(mapper, connection, target):
+    """ Record all operations about creating records,
+     including all fields changes against tables
+    """
+    log_table = inspect(UserActionLog).mapped_table
+    log_table_ins = log_table.insert().values(
+                        table_name=mapper.mapped_table.name,
+                        datetime=datetime.now(),
+                        operation='create',
+                        record_id=target.id
+                    )
+    result = connection.execute(log_table_ins)
+
+    logfield_table = inspect(UserActionLogField).mapped_table
+    tb_cols = {col.key for col in mapper.mapped_table.columns}
+    for k, v in target.__dict__.items():
+        if k in tb_cols and k != 'id':
+            logfield_table_ins = logfield_table.insert().values(
+                action_log_id=result.lastrowid,
+                field=k,
+                new_value=v
+            )
+            connection.execute(logfield_table_ins)
