@@ -1,8 +1,9 @@
 from datetime import datetime
 
 import sqlalchemy as sa
-from sqlalchemy import Column, event, inspect
-from sqlalchemy.orm import relationship, validates
+from sqlalchemy import Column, event, inspect, events
+from sqlalchemy.orm import relationship, validates, Query, events
+from sqlalchemy.sql import select
 from sqlalchemy.ext.declarative import as_declarative, declared_attr
 
 
@@ -29,7 +30,7 @@ class Base:
 
     @classmethod
     def insert_by_conn(cls, conn, **kwargs):
-        table = inspect(cls).mapped_table
+        table = inspect(cls).persist_selectable
         table_ins = table.insert().values(**kwargs)
         result = conn.execute(table_ins)
         return result
@@ -82,16 +83,16 @@ class Permission(Model):
     def roles(self):
         return Column(sa.Integer, sa.ForeignKey('role.id'))
 
-    model = Column(sa.String)
-    read_perm = Column(sa.Boolean)
-    create_perm = Column(sa.Boolean)
-    update_perm = Column(sa.Boolean)
-    delete_perm = Column(sa.Boolean)
+    table = Column(sa.String)
+    read = Column(sa.Boolean)
+    create = Column(sa.Boolean)
+    update = Column(sa.Boolean)
+    delete = Column(sa.Boolean)
 
     @validates('model')
-    def validate_model(self, key, name):
-        assert name in [t.name for t in Base.metadata.tables]
-        return name
+    def validate_model(self, key, value):
+        assert value in [t.name for t in Base.metadata.tables]
+        return value
 
 
 class UserActionLog(Model):
@@ -109,41 +110,45 @@ class UserActionLogField(Model):
     new_value = Column(sa.String)
 
 
+@event.listens_for(Query, 'before_compile', retval=True)
+def event_before_compile(query):
+    conn = query.session.connection()
+
+    for desc in query.column_descriptions:
+        model = desc['type']
+
+        _check_permission(conn, model, 'read')
+
+        # query = query.filter(entity.active == True)
+    return query
+
+
 @event.listens_for(Model, 'after_insert', propagate=True)
 def event_after_insert(mapper, connection, target):
 
     # Record all operations about creating records,
     # including all fields changes against tables
-    result = UserActionLog.insert_by_conn(
-        conn=connection,
-        operation='create',
-        table_name=mapper.mapped_table.name,
-        datetime=datetime.now(),
-        record_id=target.id
-    )
+    result = UserActionLog.insert_by_conn(conn=connection, operation='create',
+                                          table_name=mapper.persist_selectable.name,
+                                          datetime=datetime.now(),
+                                          record_id=target.id)
 
-    tb_cols = {col.key for col in mapper.mapped_table.columns}
+    tb_cols = {col.key for col in mapper.persist_selectable.columns}
     for k, v in target.__dict__.items():
         if k in tb_cols and k != 'id':
-            UserActionLogField.insert_by_conn(
-                conn=connection,
-                action_log_id=result.lastrowid,
-                field=k,
-                new_value=v
-            )
+            UserActionLogField.insert_by_conn(conn=connection,
+                                              action_log_id=result.lastrowid,
+                                              field=k, new_value=v)
 
 
 @event.listens_for(Model, 'after_update', propagate=True)
 def event_after_update(mapper, connection, target):
 
     # Record all operations about updating records
-    result = UserActionLog.insert_by_conn(
-        conn=connection,
-        operation='update',
-        table_name=mapper.mapped_table.name,
-        datetime=datetime.now(),
-        record_id=target.id
-    )
+    result = UserActionLog.insert_by_conn(conn=connection, operation='update',
+                                          table_name=mapper.persist_selectable.name,
+                                          datetime=datetime.now(),
+                                          record_id=target.id)
 
     for attr in inspect(target).attrs:
 
@@ -154,21 +159,30 @@ def event_after_update(mapper, connection, target):
         new_value = history.added[0]
         old_value = history.deleted[0]
 
-        UserActionLogField.insert_by_conn(
-            conn=connection,
-            action_log_id=result.lastrowid,
-            field=attr.key,
-            old_value=old_value,
-            new_value=new_value
-        )
+        UserActionLogField.insert_by_conn(conn=connection,
+                                          action_log_id=result.lastrowid,
+                                          field=attr.key, old_value=old_value,
+                                          new_value=new_value)
 
 
 @event.listens_for(Model, 'after_delete', propagate=True)
 def event_after_delete(mapper, connection, target):
-    UserActionLog.insert_by_conn(
-        conn=connection,
-        operation='delete',
-        table_name=mapper.mapped_table.name,
-        datetime=datetime.now(),
-        record_id=target.id
+    UserActionLog.insert_by_conn(conn=connection, operation='delete',
+                                 table_name=mapper.persist_selectable.name,
+                                 datetime=datetime.now(), record_id=target.id)
+
+
+def _check_permission(conn, model: Model, operation):
+    result = conn.execute(
+        select([Permission])
+        .where(
+            Permission.table == model.__tablename__
+        )
     )
+    row = result.fetchone()
+    if not row:
+        raise PermissionError
+
+    data = dict(row.items())
+    if data[operation] is False:
+        raise PermissionError
