@@ -80,8 +80,12 @@ class Role(Model):
 
 class Permission(Model):
     @declared_attr
-    def roles(self):
+    def role_id(self):
         return Column(sa.Integer, sa.ForeignKey('role.id'))
+
+    @declared_attr
+    def role(self):
+        return relationship('Role')
 
     table = Column(sa.String)
     read = Column(sa.Boolean)
@@ -101,6 +105,46 @@ class UserActionLog(Model):
     operation = Column(sa.String)
     record_id = Column(sa.Integer)
     log_fields = relationship('UserActionLogField')
+
+    @classmethod
+    def logging(cls, conn, operation, target):
+        table = inspect(target).mapper.persist_selectable
+        result = cls.insert_by_conn(
+            conn=conn,
+            operation=operation,
+            table_name=table.name,
+            datetime=datetime.now(),
+            record_id=target.id
+        )
+
+        if operation == 'create':
+            tb_cols = {col.key for col in table.columns}
+            for k, v in target.__dict__.items():
+                if k in tb_cols and k != 'id':
+                    UserActionLogField.insert_by_conn(
+                        conn=conn,
+                        action_log_id=result.lastrowid,
+                        field=k,
+                        new_value=v
+                    )
+
+        elif operation == 'update':
+            for attr in inspect(target).attrs:
+
+                history = attr.load_history()
+                if not history.has_changes():
+                    continue
+
+                old_value = ', '.join(str(value) for value in history.deleted) or None
+                new_value = ', '.join(str(value) for value in history.added) or None
+
+                UserActionLogField.insert_by_conn(
+                    conn=conn,
+                    action_log_id=result.lastrowid,
+                    field=attr.key,
+                    old_value=old_value,
+                    new_value=new_value
+                )
 
 
 class UserActionLogField(Model):
@@ -125,51 +169,17 @@ def event_before_compile(query):
 
 @event.listens_for(Model, 'after_insert', propagate=True)
 def event_after_insert(mapper, connection, target):
-
-    # Record all operations about creating records,
-    # including all fields changes against tables
-    result = UserActionLog.insert_by_conn(conn=connection, operation='create',
-                                          table_name=mapper.persist_selectable.name,
-                                          datetime=datetime.now(),
-                                          record_id=target.id)
-
-    tb_cols = {col.key for col in mapper.persist_selectable.columns}
-    for k, v in target.__dict__.items():
-        if k in tb_cols and k != 'id':
-            UserActionLogField.insert_by_conn(conn=connection,
-                                              action_log_id=result.lastrowid,
-                                              field=k, new_value=v)
+    UserActionLog.logging(connection, 'create', target)
 
 
 @event.listens_for(Model, 'after_update', propagate=True)
 def event_after_update(mapper, connection, target):
-
-    # Record all operations about updating records
-    result = UserActionLog.insert_by_conn(conn=connection, operation='update',
-                                          table_name=mapper.persist_selectable.name,
-                                          datetime=datetime.now(),
-                                          record_id=target.id)
-
-    for attr in inspect(target).attrs:
-
-        history = attr.load_history()
-        if not history.has_changes():
-            continue
-
-        new_value = history.added[0]
-        old_value = history.deleted[0]
-
-        UserActionLogField.insert_by_conn(conn=connection,
-                                          action_log_id=result.lastrowid,
-                                          field=attr.key, old_value=old_value,
-                                          new_value=new_value)
+    UserActionLog.logging(connection, 'update', target)
 
 
 @event.listens_for(Model, 'after_delete', propagate=True)
 def event_after_delete(mapper, connection, target):
-    UserActionLog.insert_by_conn(conn=connection, operation='delete',
-                                 table_name=mapper.persist_selectable.name,
-                                 datetime=datetime.now(), record_id=target.id)
+    UserActionLog.logging(connection, 'delete', target)
 
 
 def _check_permission(conn, model: Model, operation):
